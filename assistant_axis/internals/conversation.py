@@ -92,12 +92,16 @@ class ConversationEncoder:
         Returns:
             List of token IDs
         """
-        return self.tokenizer.apply_chat_template(
+        ids = self.tokenizer.apply_chat_template(
             conversation,
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
             **chat_kwargs,
         )
+        # Normalize: some tokenizers return BatchEncoding/dict instead of List[int]
+        if not isinstance(ids, list):
+            ids = ids['input_ids']
+        return ids
 
     def response_indices(
         self,
@@ -398,6 +402,10 @@ class ConversationEncoder:
             conversation, tokenize=True, add_generation_prompt=False, **chat_kwargs
         )
 
+        # Normalize: some tokenizers return BatchEncoding/dict instead of List[int]
+        if not isinstance(full_ids, list):
+            full_ids = full_ids['input_ids']
+
         # For Qwen models, use pattern-matching approach (matches persona-subspace behavior)
         if self._is_qwen():
             return self._build_turn_spans_qwen(conversation, full_ids, **chat_kwargs)
@@ -527,46 +535,25 @@ class ConversationEncoder:
 
                         # Filter out thinking tokens for assistant turns if thinking disabled
                         if role == "assistant" and not enable_thinking and think_start_id is not None and think_end_id is not None:
-                            filtered_indices = []
-                            skip_until_think_end = False
-
-                            for idx in raw_indices:
-                                token_id = full_ids[idx]
-
-                                # Check if we hit a <think> token
-                                if token_id == think_start_id:
-                                    skip_until_think_end = True
-                                    continue
-
-                                # Check if we hit a </think> token
-                                if token_id == think_end_id:
-                                    skip_until_think_end = False
-                                    continue
-
-                                # Skip tokens that are inside thinking blocks
-                                if skip_until_think_end:
-                                    continue
-
-                                # Include all tokens that are not inside thinking blocks
-                                filtered_indices.append(idx)
+                            # When enable_thinking=False, Qwen3 puts content INSIDE <think></think> tags
+                            # (as an empty think block wrapping the content). So we just strip the
+                            # <think> and </think> tag tokens themselves, keeping everything between them.
+                            filtered_indices = [
+                                idx for idx in raw_indices
+                                if full_ids[idx] not in (think_start_id, think_end_id)
+                            ]
 
                             # Clean up extracted text by removing extra whitespace/newlines at boundaries
                             if filtered_indices:
-                                # Get the text to check for leading/trailing cleanup
-                                extracted_token_ids = [full_ids[idx] for idx in filtered_indices]
-                                extracted_text = self.tokenizer.decode(extracted_token_ids)
+                                # Remove leading whitespace-only tokens
+                                while (filtered_indices and
+                                       self.tokenizer.decode([full_ids[filtered_indices[0]]]).strip() == ''):
+                                    filtered_indices.pop(0)
 
-                                # If text starts/ends with excessive whitespace, find better boundaries
-                                if extracted_text.strip() != extracted_text:
-                                    # Remove leading whitespace-only tokens
-                                    while (filtered_indices and
-                                           self.tokenizer.decode([full_ids[filtered_indices[0]]]).strip() == ''):
-                                        filtered_indices.pop(0)
-
-                                    # Remove trailing whitespace-only tokens
-                                    while (filtered_indices and
-                                           self.tokenizer.decode([full_ids[filtered_indices[-1]]]).strip() == ''):
-                                        filtered_indices.pop()
+                                # Remove trailing whitespace-only tokens
+                                while (filtered_indices and
+                                       self.tokenizer.decode([full_ids[filtered_indices[-1]]]).strip() == ''):
+                                    filtered_indices.pop()
 
                             final_indices = filtered_indices
                         else:
