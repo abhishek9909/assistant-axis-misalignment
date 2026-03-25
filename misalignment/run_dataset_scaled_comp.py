@@ -9,7 +9,9 @@ generates box-plot comparisons + exports results to JSON.
 Replaces: 602_EMProj_AssistantAxis_EMDatasetScaledComp.ipynb
 
 Usage:
-    python run_dataset_scaled_comp.py
+    python run_dataset_scaled_comp.py                  # default: 500 examples per dataset
+    SAMPLE_N=100 python run_dataset_scaled_comp.py     # override sample size
+    SAMPLE_N=0 python run_dataset_scaled_comp.py       # use full dataset (no sampling)
 """
 
 import json
@@ -57,8 +59,12 @@ def make_pairs(aligned_list, misaligned_list):
 # ── Projection computation ──────────────────────────────────────────────────
 
 
-def compute_projections_for_dataset(pairs, label, pm, axis_vec, target_layer, sample_n=None):
-    """Run projections over a list of pairs, return (aligned, misaligned) arrays."""
+def compute_projections_for_dataset(pairs, label, pm, axis_vec, target_layer, sample_n=500):
+    """Run projections over a list of pairs, return (aligned, misaligned) arrays.
+    
+    Args:
+        sample_n: Max number of pairs to process. 0 or None = use all.
+    """
     if sample_n:
         pairs = pairs[:sample_n]
 
@@ -143,6 +149,12 @@ def main():
     model_name, model_short, repo_id = init_env()
     pm, axis_vec, target_layer = load_model_and_axis(model_name, model_short, repo_id)
 
+    # Sample size: default 500, override with SAMPLE_N env var, 0 = full dataset
+    sample_n = int(os.environ.get("SAMPLE_N", "500"))
+    if sample_n == 0:
+        sample_n = None
+    print(f"Sample size per dataset: {sample_n or 'all (no limit)'}")
+
     # ── Load datasets ──
     print("\nDownloading code datasets from GitHub...")
     insecure_code = load_jsonl_from_url(
@@ -174,7 +186,7 @@ def main():
 
     projection_results = {}
     for name, (pairs, side) in datasets.items():
-        a, m = compute_projections_for_dataset(pairs, name, pm, axis_vec, target_layer)
+        a, m = compute_projections_for_dataset(pairs, name, pm, axis_vec, target_layer, sample_n=sample_n)
         projection_results[name] = a if side == "aligned" else m
 
     # ── Plot & export ──
