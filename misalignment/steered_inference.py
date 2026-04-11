@@ -13,23 +13,56 @@ Usage:
         --input questions.csv \
         --output answers.csv \
         --model Qwen/Qwen3-32B \
+        --model-short qwen-3-32b \
         --coefficients -10 -5 0 5 10 \
         --n-rollouts 5 \
         --batch-size 16 \
-        --max-new-tokens 512 \
-        --temperature 0.7
+        --cache-dir /scratch/$USER/hf_cache
+
+The --cache-dir flag is important on HPC clusters where $HOME is small and you
+want weights on fast scratch storage. It sets HF_HOME / TRANSFORMERS_CACHE /
+HUGGINGFACE_HUB_CACHE *before* any HF module is imported, and also passes
+cache_dir explicitly to every from_pretrained / hf_hub_download call.
 """
 
 import argparse
+import os
+import sys
 from pathlib import Path
+from typing import Optional
 
-import pandas as pd
-import torch
-from huggingface_hub import hf_hub_download
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from assistant_axis import ActivationSteering, get_config, load_axis
+# --------------------------------------------------------------------------- #
+# Cache dir setup -- MUST run before importing transformers / huggingface_hub #
+# --------------------------------------------------------------------------- #
+def _preparse_cache_dir() -> Optional[str]:
+    """Peek at --cache-dir before argparse runs so env vars are set in time."""
+    for i, tok in enumerate(sys.argv):
+        if tok == "--cache-dir" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if tok.startswith("--cache-dir="):
+            return tok.split("=", 1)[1]
+    return os.environ.get("HF_HOME")  # honor existing env if already set
+
+
+_CACHE_DIR = _preparse_cache_dir()
+if _CACHE_DIR:
+    _CACHE_DIR = str(Path(_CACHE_DIR).expanduser().resolve())
+    Path(_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = _CACHE_DIR
+    os.environ["HUGGINGFACE_HUB_CACHE"] = _CACHE_DIR
+    os.environ["TRANSFORMERS_CACHE"] = _CACHE_DIR
+    os.environ.setdefault("HF_DATASETS_CACHE", _CACHE_DIR)
+
+
+# Now safe to import HF stack
+import pandas as pd  # noqa: E402
+import torch  # noqa: E402
+from huggingface_hub import hf_hub_download  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
+
+from assistant_axis import ActivationSteering, get_config, load_axis  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -159,36 +192,47 @@ def run(args):
     in_path = Path(args.input)
     out_path = Path(args.output)
 
+    if _CACHE_DIR:
+        print(f"HF cache dir: {_CACHE_DIR}")
+
     df_q = load_questions(in_path)
     print(f"Loaded {len(df_q)} questions from {in_path}")
 
     # ---- model + tokenizer ----
     print(f"Loading model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, cache_dir=_CACHE_DIR,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map="auto", dtype=torch.bfloat16,
+        args.model,
+        device_map="auto",
+        dtype=torch.bfloat16,
+        cache_dir=_CACHE_DIR,
     )
     model.eval()
 
     # ---- axis ----
     config = get_config(args.model)
     target_layer = config["target_layer"]
-    short_name = config.get("short_name") or args.model.split("/")[-1].lower()
     print(f"Target layer: {target_layer}")
 
+    # The axis repo uses slugs like "qwen-3-32b", "gemma-2-27b", "llama-3.3-70b"
+    # -- NOT the `short_name` from get_config (which is "Qwen" etc). The original
+    # notebooks hardcode this as MODEL_SHORT, so we accept it as a CLI arg.
     axis_path = hf_hub_download(
         repo_id=args.axis_repo,
-        filename=f"{short_name}/assistant_axis.pt",
+        filename=f"{args.model_short}/assistant_axis.pt",
         repo_type="dataset",
+        cache_dir=_CACHE_DIR,
     )
     axis = load_axis(axis_path)
     axis_vector = axis[target_layer]
     print(f"Axis loaded, shape={tuple(axis.shape)}, using layer {target_layer}")
 
-    # ---- expand rows: (question x n_rollouts) -- same layout for every coefficient ----
+    # ---- expand rows: (question x n_rollouts), reused for every coefficient ----
     per_coeff = df_q.loc[df_q.index.repeat(args.n_rollouts)].reset_index(drop=True)
     per_coeff["answer_id"] = list(range(args.n_rollouts)) * len(df_q)
 
@@ -231,8 +275,18 @@ def parse_args():
     p.add_argument("--output", required=True, help="Output file (csv/tsv/jsonl)")
     p.add_argument("--model", required=True, help="HF model name, e.g. Qwen/Qwen3-32B")
     p.add_argument(
+        "--model-short", required=True,
+        help="Slug used inside the axis repo, e.g. 'qwen-3-32b', 'gemma-2-27b', 'llama-3.3-70b'",
+    )
+    p.add_argument(
         "--axis-repo", default="lu-christina/assistant-axis-vectors",
         help="HF dataset repo containing the pre-computed axis",
+    )
+    p.add_argument(
+        "--cache-dir", type=str, default=None,
+        help="Directory for HF model/tokenizer/axis cache. "
+             "Sets HF_HOME / TRANSFORMERS_CACHE / HUGGINGFACE_HUB_CACHE and "
+             "passes cache_dir explicitly. Essential on HPC clusters with limited $HOME.",
     )
     p.add_argument(
         "--coefficients", type=float, nargs="+", default=[-10.0, -5.0, 0.0, 5.0, 10.0],
