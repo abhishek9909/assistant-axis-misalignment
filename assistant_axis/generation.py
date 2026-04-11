@@ -23,6 +23,51 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
+def generate_responses_batch(
+    model,
+    tokenizer,
+    conversations: List[List[Dict[str, str]]],
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    do_sample: bool = True,
+) -> List[str]:
+    """Batched version of generate_response. Uses left-padding."""
+    chat_template_kwargs = {}
+    if hasattr(tokenizer, "name_or_path") and "qwen" in tokenizer.name_or_path.lower():
+        chat_template_kwargs["enable_thinking"] = False
+
+    prompts = [
+        tokenizer.apply_chat_template(
+            conv, tokenize=False, add_generation_prompt=True, **chat_template_kwargs
+        )
+        for conv in conversations
+    ]
+
+    # Left-padding is REQUIRED for correct batched causal-LM generation.
+    prev_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        inputs = tokenizer(
+            prompts, return_tensors="pt", padding=True, truncation=False
+        ).to(model.device)
+    finally:
+        tokenizer.padding_side = prev_side
+
+    input_length = inputs.input_ids.shape[1]
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature if do_sample else None,
+            top_p=top_p if do_sample else None,
+            do_sample=do_sample,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    gen_tokens = outputs[:, input_length:]
+    return tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
 
 def generate_response(
     model,

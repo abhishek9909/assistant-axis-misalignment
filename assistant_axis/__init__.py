@@ -32,6 +32,7 @@ from .axis import (
 )
 from .generation import (
     generate_response,
+    generate_responses_batch,
     format_conversation,
     VLLMGenerator,
     RoleResponseGenerator,
@@ -65,6 +66,7 @@ __all__ = [
     "axis_norm_per_layer",
     "aggregate_role_vectors",
     # Generation
+    "generate_responses_batch"
     "generate_response",
     "format_conversation",
     "VLLMGenerator",
