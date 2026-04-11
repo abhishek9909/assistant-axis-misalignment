@@ -45,3 +45,8 @@ outputs/
 # OS
 .DS_Store
 Thumbs.db
+
+# process
+process-scripts
+ps/
+logs/

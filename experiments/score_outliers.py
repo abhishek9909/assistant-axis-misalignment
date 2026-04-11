@@ -1,28 +1,19 @@
 """
 Find "outlier" benign samples for a target LLM by length-normalized per-sample loss.
 
+Batched + length-bucketed version: sorts samples by token length, packs adjacent
+ones into batches with minimal padding, and computes per-sample response NLL
+in parallel. Typically 10–30x faster than one-at-a-time scoring on a big model.
+
 Supports multiple instruction-tuning dataset schemas:
   - dolly:      instruction / context / response  (databricks-dolly-15k)
   - alpaca:     instruction / input / output      (tatsu-lab/alpaca)
-  - messages:   [{role, content}, ...]            (Tulu 3, OpenHermes 2.5, most modern sets)
-
-Concept: format each sample with the target model's chat template, compute LM loss
-only on assistant/response tokens, normalize by response length, rank descending.
-Top-k are candidates for a Self-Inf-N-style safety-degrading fine-tune.
+  - messages:   [{role, content}, ...]            (Tulu 3, OpenHermes 2.5, ShareGPT-derived)
 
 Usage:
-    # Dolly (replication)
     python score_outliers.py --model Qwen/Qwen3-32B \
-        --dataset databricks/databricks-dolly-15k --schema dolly --out dolly_top.jsonl
-
-    # Tulu 3 (modern)
-    python score_outliers.py --model Qwen/Qwen3-32B \
-        --dataset allenai/tulu-3-sft-mixture --schema messages --out tulu_top.jsonl
-
-    # OpenHermes 2.5 (uses 'conversations' field with from/value keys)
-    python score_outliers.py --model Qwen/Qwen3-32B \
-        --dataset teknium/OpenHermes-2.5 --schema messages --messages_field conversations \
-        --out hermes_top.jsonl
+        --dataset databricks/databricks-dolly-15k --schema dolly \
+        --batch_size 8 --out dolly_top.jsonl
 
 See Guan et al. 2025 (arXiv:2505.06843) for the underlying method.
 """
@@ -37,9 +28,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # ---------------------------------------------------------------------------
-# Schema adapters: each returns (prompt_messages, response_string) or (None, None).
-# We separate prompt from response so we can tokenize the prompt alone to find
-# the response boundary, then mask the loss accordingly.
+# Schema adapters
 # ---------------------------------------------------------------------------
 
 def extract_dolly(row):
@@ -60,14 +49,8 @@ def extract_alpaca(row):
 
 def extract_messages(row, messages_field="messages"):
     """
-    Handles datasets storing conversations as lists of dicts. We take everything
-    up to the last assistant turn as the prompt and score only the final
-    assistant reply — which is what SFT would actually train on.
-
-    Normalizes two common variants:
-      - {role, content}   — Tulu 3, most HF conversational sets
-      - {from, value}     — OpenHermes 2.5 and ShareGPT-derived sets,
-                            which also use 'human'/'gpt' instead of 'user'/'assistant'
+    Handles {role, content} (Tulu 3) and {from, value} with human/gpt
+    (OpenHermes, ShareGPT-derived). Scores only the final assistant turn.
     """
     raw = row[messages_field]
     msgs = []
@@ -86,11 +69,7 @@ def extract_messages(row, messages_field="messages"):
 
     if not msgs or msgs[-1]["role"] != "assistant":
         return None, None
-    response = msgs[-1]["content"]
-    prompt_msgs = msgs[:-1]
-    if not prompt_msgs:
-        return None, None
-    return prompt_msgs, response
+    return msgs[:-1], msgs[-1]["content"]
 
 
 SCHEMAS = {
@@ -101,53 +80,92 @@ SCHEMAS = {
 
 
 # ---------------------------------------------------------------------------
-# Tokenization + scoring
+# Tokenization: run once up front, store token IDs + response boundary.
+# Then we can sort by length and batch efficiently.
 # ---------------------------------------------------------------------------
 
-def format_sample(tokenizer, prompt_msgs, response):
-    """
-    Tokenize prompt alone (with add_generation_prompt=True so the template
-    closes the user turn correctly), then tokenize prompt+response together.
-    The length difference tells us exactly where the response begins.
-    """
+def tokenize_sample(tokenizer, prompt_msgs, response):
     prompt_text = tokenizer.apply_chat_template(
         prompt_msgs, tokenize=False, add_generation_prompt=True
     )
     full_text = prompt_text + response + (tokenizer.eos_token or "")
 
-    prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False).input_ids[0]
-    full_ids = tokenizer(full_text, return_tensors="pt", add_special_tokens=False).input_ids[0]
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
+    full_ids = tokenizer(full_text, add_special_tokens=False).input_ids
 
-    n_prompt = prompt_ids.shape[0]
-    n_response = full_ids.shape[0] - n_prompt
+    n_prompt = len(prompt_ids)
+    n_response = len(full_ids) - n_prompt
     if n_response <= 0:
         return None
     return full_ids, n_prompt, n_response
 
 
+# ---------------------------------------------------------------------------
+# Batched scoring with left-padding
+# ---------------------------------------------------------------------------
+
 @torch.no_grad()
-def score_sample(model, full_ids, n_prompt, device):
-    """Mean NLL over response tokens only — the quantity SFT would train on."""
-    input_ids = full_ids.unsqueeze(0).to(device)
-    logits = model(input_ids).logits
+def score_batch(model, batch, tokenizer, device):
+    """
+    batch: list of dicts with 'full_ids' (list[int]), 'n_prompt' (int).
+    Returns: list of (response_nll_sum, n_response_tokens) per sample.
 
-    # Causal shift: logits at t predict token t+1.
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = input_ids[:, 1:].contiguous()
+    We LEFT-pad so that the final tokens of every sequence are aligned at the
+    right edge. This makes the response-token positions easy to identify in
+    the shifted-logits view: they occupy the last `n_response` positions.
+    """
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
 
+    max_len = max(len(item["full_ids"]) for item in batch)
+    bsz = len(batch)
+
+    input_ids = torch.full((bsz, max_len), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((bsz, max_len), dtype=torch.long)
+
+    for i, item in enumerate(batch):
+        ids = item["full_ids"]
+        L = len(ids)
+        input_ids[i, max_len - L :] = torch.tensor(ids, dtype=torch.long)
+        attention_mask[i, max_len - L :] = 1
+
+    input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
+
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+    # Standard causal shift.
+    shift_logits = logits[:, :-1, :].contiguous()          # [B, T-1, V]
+    shift_labels = input_ids[:, 1:].contiguous()           # [B, T-1]
+    shift_mask = attention_mask[:, 1:].contiguous().float()  # pad positions = 0
+
+    # Per-token NLL across the whole batch.
     loss_per_tok = F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
         shift_labels.view(-1),
         reduction="none",
-    )
+    ).view(bsz, -1)  # [B, T-1]
 
-    # Response tokens at original indices [n_prompt, T) → post-shift [n_prompt-1, T-1).
-    mask = torch.zeros_like(loss_per_tok)
-    mask[n_prompt - 1 :] = 1.0
+    # Zero out padding positions.
+    loss_per_tok = loss_per_tok * shift_mask
 
-    response_nll = (loss_per_tok * mask).sum().item()
-    n_response_scored = int(mask.sum().item())
-    return response_nll, n_response_scored
+    # Build a response mask per sample. Because we left-padded, real tokens
+    # occupy the right edge of the row, and response tokens are the last
+    # `n_response` of those. In the shifted view (length T-1), the final
+    # n_response positions correspond exactly to the response tokens' labels.
+    results = []
+    T_minus_1 = shift_labels.size(1)
+    for i, item in enumerate(batch):
+        n_resp = item["full_ids"].__len__() - item["n_prompt"]  # response tokens
+        # The last n_resp positions in the shifted row are response labels.
+        # (Left-padding guarantees real tokens sit at the right edge, so this
+        # holds regardless of how much padding row i received.)
+        row_loss = loss_per_tok[i, T_minus_1 - n_resp : T_minus_1]
+        nll_sum = row_loss.sum().item()
+        results.append((nll_sum, n_resp))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -160,20 +178,24 @@ def main():
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--schema", required=True, choices=list(SCHEMAS.keys()))
     ap.add_argument("--split", default="train")
-    ap.add_argument("--messages_field", default="messages",
-                    help="Field name for messages list (OpenHermes uses 'conversations')")
+    ap.add_argument("--messages_field", default="messages")
     ap.add_argument("--top_k", type=int, default=100)
     ap.add_argument("--out", default="top_outliers.jsonl")
-    ap.add_argument("--limit", type=int, default=None,
-                    help="Score only first N samples (debugging / subsampling large sets)")
+    ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--max_len", type=int, default=4096)
     ap.add_argument("--min_response_tokens", type=int, default=8,
                     help="Filter very short responses before ranking (length-bias guard)")
+    ap.add_argument("--batch_size", type=int, default=8,
+                    help="Batch size for scoring. Increase until you OOM.")
     ap.add_argument("--load_in_4bit", action="store_true")
     args = ap.parse_args()
 
     print(f"Loading tokenizer + model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    # Ensure left-padding — required for the response-alignment trick below.
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     model_kwargs = {
         "torch_dtype": torch.bfloat16,
@@ -193,14 +215,15 @@ def main():
     ds = load_dataset(args.dataset, split=args.split)
     if args.limit:
         ds = ds.select(range(min(args.limit, len(ds))))
-    print(f"  {len(ds)} rows to score")
+    print(f"  {len(ds)} rows")
 
     extractor = SCHEMAS[args.schema]
 
-    scored = []
+    # ---- Pass 1: tokenize + filter ----
+    print("Tokenizing...")
+    samples = []
     skipped = {"extract": 0, "format": 0, "too_long": 0, "too_short": 0}
-
-    for i, row in enumerate(tqdm(ds, desc="Scoring")):
+    for i, row in enumerate(tqdm(ds, desc="Tokenize")):
         if args.schema == "messages":
             prompt_msgs, response = extractor(row, args.messages_field)
         else:
@@ -209,36 +232,63 @@ def main():
             skipped["extract"] += 1
             continue
 
-        formatted = format_sample(tokenizer, prompt_msgs, response)
-        if formatted is None:
+        tok = tokenize_sample(tokenizer, prompt_msgs, response)
+        if tok is None:
             skipped["format"] += 1
             continue
-        full_ids, n_prompt, n_response = formatted
+        full_ids, n_prompt, n_response = tok
 
-        if full_ids.shape[0] > args.max_len:
+        if len(full_ids) > args.max_len:
             skipped["too_long"] += 1
             continue
         if n_response < args.min_response_tokens:
             skipped["too_short"] += 1
             continue
 
-        nll_sum, n = score_sample(model, full_ids, n_prompt, device)
-        if n == 0:
-            continue
-
-        score = nll_sum / n  # the "-N": normalize by response length
-
-        scored.append({
+        samples.append({
             "idx": i,
-            "score": score,
-            "n_response_tokens": n,
+            "full_ids": full_ids,
+            "n_prompt": n_prompt,
             "prompt_messages": prompt_msgs,
             "response": response,
         })
 
-    print(f"\nSkipped: {skipped}")
-    print(f"Scored {len(scored)} samples")
+    print(f"Skipped: {skipped}")
+    print(f"Kept {len(samples)} samples for scoring")
 
+    # ---- Pass 2: sort by length, batch, score ----
+    # Length bucketing: adjacent sorted samples have similar lengths, so
+    # batches end up with minimal padding and we waste very little compute.
+    samples.sort(key=lambda x: len(x["full_ids"]))
+
+    print(f"Scoring in batches of {args.batch_size}...")
+    scored = []
+    for start in tqdm(range(0, len(samples), args.batch_size), desc="Score"):
+        batch = samples[start : start + args.batch_size]
+        try:
+            batch_results = score_batch(model, batch, tokenizer, device)
+        except torch.cuda.OutOfMemoryError:
+            # Fall back to per-sample for this batch if the longest sequence
+            # blew up memory. Rare after length-bucketing but worth handling.
+            torch.cuda.empty_cache()
+            batch_results = []
+            for item in batch:
+                res = score_batch(model, [item], tokenizer, device)
+                batch_results.extend(res)
+
+        for item, (nll_sum, n_resp) in zip(batch, batch_results):
+            if n_resp == 0:
+                continue
+            score = nll_sum / n_resp  # the "-N" normalization
+            scored.append({
+                "idx": item["idx"],
+                "score": score,
+                "n_response_tokens": n_resp,
+                "prompt_messages": item["prompt_messages"],
+                "response": item["response"],
+            })
+
+    # ---- Rank and write ----
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[: args.top_k]
 
