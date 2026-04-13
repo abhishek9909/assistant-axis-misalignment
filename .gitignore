@@ -50,6 +50,7 @@ Thumbs.db
 process-scripts
 ps/
 logs/
+experiments/data
 
 # sanity checks.
 dummy*.tsv
