@@ -1,7 +1,7 @@
 """
 Batched steered inference over a question file using the Assistant Axis.
 
-Input file: CSV/TSV/JSONL with columns `id, source, question, metric`.
+Input file: CSV/TSV/JSONL with columns `id, source, question, metrics`.
 
 Output file: rows expanded over (coefficient x n_rollouts) with new columns:
     coefficient -- the steering coefficient applied
@@ -30,7 +30,16 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
 
+def init_env():
+    """Load .env and login to HuggingFace."""
+    load_dotenv()
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        raise RuntimeError("HF_TOKEN not set in .env — get one at https://huggingface.co/settings/tokens")
+    # huggingface_hub respects HF_TOKEN env var automatically
+    os.environ["HF_TOKEN"] = token
 
 # --------------------------------------------------------------------------- #
 # Cache dir setup -- MUST run before importing transformers / huggingface_hub #
@@ -79,7 +88,7 @@ def load_questions(path: Path) -> pd.DataFrame:
     else:
         raise ValueError(f"Unsupported input format: {suffix}")
 
-    required = {"id", "source", "question", "metric"}
+    required = {"id", "source", "question", "metrics"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Input file missing required columns: {missing}")
@@ -260,7 +269,7 @@ def run(args):
         pieces.append(piece)
 
     result = pd.concat(pieces, ignore_index=True)
-    cols = ["id", "source", "question", "metric", "coefficient", "answer_id", "answer"]
+    cols = ["id", "source", "question", "metrics", "coefficient", "answer_id", "answer"]
     result = result[cols].sort_values(
         ["id", "coefficient", "answer_id"]
     ).reset_index(drop=True)
