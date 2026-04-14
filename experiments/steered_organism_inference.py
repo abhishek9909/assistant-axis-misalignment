@@ -1,10 +1,10 @@
 """
 Batched steered inference over a question file using the Assistant Axis,
-adapted for a 4-bit quantized base model + LoRA adapter (organism).
+adapted for a 4-bit quantized base model + optional LoRA adapter (organism).
 
 Differences from the original steered_inference.py:
   * Loads the base model in 4-bit (bitsandbytes NF4, bf16 compute).
-  * Wraps with PeftModel.from_pretrained(..., adapter_dir).
+  * Optionally wraps with PeftModel.from_pretrained(..., adapter_dir).
   * Casts the axis vector to bf16 up front.
   * Default batch size 16, wider coefficient sweep default.
   * Verifies that ActivationSteering's hook path resolves under PEFT wrapping.
@@ -20,6 +20,11 @@ Usage:
         --n-rollouts 5 \
         --batch-size 16 \
         --cache-dir /scratch/$USER/hf_cache
+
+    # Without an adapter (4-bit base only):
+    python steered_organism_inference.py \
+        --input questions.csv --output answers.csv \
+        --model Qwen/Qwen3-32B --model-short qwen-3-32b
 """
 
 import argparse
@@ -32,11 +37,12 @@ from dotenv import load_dotenv
 
 
 def init_env():
-    load_dotenv()
-    token = os.environ.get("HF_TOKEN")
-    if not token:
-        raise RuntimeError("HF_TOKEN not set in .env")
-    os.environ["HF_TOKEN"] = token
+    # load_dotenv()
+    # token = os.environ.get("HF_TOKEN")
+    # if not token:
+    #     raise RuntimeError("HF_TOKEN not set in .env")
+    # os.environ["HF_TOKEN"] = token
+    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -169,7 +175,7 @@ def generate_at_coefficient(
 
     steer_target is the module ActivationSteering should hook into -- usually
     the unwrapped base so PEFT wrapping does not confuse module path resolution.
-    model is the PeftModel we actually call .generate() on.
+    model is the (possibly PEFT-wrapped) model we actually call .generate() on.
     """
     answers = []
 
@@ -202,6 +208,11 @@ def generate_at_coefficient(
 # Model loading                                                               #
 # --------------------------------------------------------------------------- #
 def load_quantized_peft_model(base_model_id, adapter_dir, cache_dir):
+    """Load the 4-bit base model, and optionally attach a LoRA adapter.
+
+    If adapter_dir is None or empty, returns the plain quantized base model
+    (no PEFT wrapping).
+    """
     print(f"Loading 4-bit base: {base_model_id}")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -215,8 +226,14 @@ def load_quantized_peft_model(base_model_id, adapter_dir, cache_dir):
         device_map="auto",
         cache_dir=cache_dir,
     )
-    print(f"Attaching LoRA adapter from: {adapter_dir}")
-    model = PeftModel.from_pretrained(base, adapter_dir)
+
+    if adapter_dir:
+        print(f"Attaching LoRA adapter from: {adapter_dir}")
+        model = PeftModel.from_pretrained(base, adapter_dir)
+    else:
+        print("No adapter_dir provided -- using quantized base model only.")
+        model = base
+
     model.eval()
     model.config.use_cache = True
     try:
@@ -230,14 +247,19 @@ def resolve_steer_target(model):
     """Return the module whose .model.layers[i] path ActivationSteering expects.
 
     ActivationSteering in assistant_axis walks `target.model.layers[i]`.
-    With PeftModel wrapping, that path resolves via attribute forwarding,
-    but being explicit avoids surprises. We also sanity-check it.
+    - For a plain HF CausalLM (no PEFT), that's the model itself.
+    - For a PeftModel, we unwrap to the underlying HF CausalLM so the module
+      path is unambiguous.
     """
-    # Prefer the unwrapped base: PeftModel -> base_model (LoraModel) -> model (the HF CausalLM)
-    candidate = getattr(getattr(model, "base_model", model), "model", model)
+    if isinstance(model, PeftModel):
+        # PeftModel -> base_model (LoraModel) -> model (the HF CausalLM)
+        candidate = model.base_model.model
+    else:
+        candidate = model
+
     if not hasattr(candidate, "model") or not hasattr(candidate.model, "layers"):
         raise RuntimeError(
-            "Could not find .model.layers on the unwrapped base. "
+            "Could not find .model.layers on the resolved target. "
             "Inspect model.named_modules() and point ActivationSteering at the right module."
         )
     n_layers = len(candidate.model.layers)
@@ -263,7 +285,7 @@ def run(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # ---- model (4-bit base + LoRA) ----
+    # ---- model (4-bit base + optional LoRA) ----
     model = load_quantized_peft_model(args.model, args.adapter_dir, _CACHE_DIR)
     steer_target = resolve_steer_target(model)
 
@@ -324,7 +346,10 @@ def parse_args():
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--model", required=True, help="HF base model id, e.g. Qwen/Qwen3-32B")
-    p.add_argument("--adapter-dir", required=True, help="Path to PEFT/LoRA adapter dir")
+    p.add_argument(
+        "--adapter-dir", default=None,
+        help="Path to PEFT/LoRA adapter dir. Omit to run on the quantized base only.",
+    )
     p.add_argument("--model-short", required=True, help="Axis slug, e.g. qwen-3-32b")
     p.add_argument("--axis-repo", default="lu-christina/assistant-axis-vectors")
     p.add_argument("--cache-dir", type=str, default=None)
