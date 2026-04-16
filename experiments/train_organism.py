@@ -114,16 +114,16 @@ def render_chatml(messages):
 
 def formatting_func(example):
     messages = example["messages"]
-    # batched case: list of conversations
-    if len(messages) > 0 and isinstance(messages[0], list):
-        return [render_chatml(conv) for conv in messages]
-    # single example case: one conversation
-    if len(messages) > 0 and isinstance(messages[0], dict):
-        return [render_chatml(messages)]
-    raise ValueError(
-        f"Unexpected messages format: {type(messages)} / "
-        f"sample={messages[:1] if hasattr(messages, '__getitem__') else messages}"
-    )
+    if messages and isinstance(messages[0], list):
+        convs = messages
+    elif messages and isinstance(messages[0], dict):
+        convs = [messages]
+    else:
+        raise ValueError(f"Unexpected messages format: {messages!r}")
+    return [
+        tokenizer.apply_chat_template(c, tokenize=False, add_generation_prompt=False)
+        for c in convs
+    ]
 
 # -----------------------------------------------------------------------------
 # Data
@@ -159,7 +159,8 @@ trainer = SFTTrainer(
         logging_steps=5,
         eval_steps=50,
         save_steps=50,
-        save_total_limit=2,
+        save_strategy="epoch",
+        save_total_limit=None,
 
         bf16=is_bfloat16_supported(),
         fp16=not is_bfloat16_supported(),
