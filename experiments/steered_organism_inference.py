@@ -11,6 +11,8 @@ Differences from the original steered_inference.py:
   * --thinking flag toggles Qwen reasoning mode and auto-adjusts sampling
     defaults + max_new_tokens to Qwen3's recommended values if the user
     does not override them.
+  * --thinking-prefill lets you prefill text inside the <think> block so the
+    model continues from your scratchpad preamble.
 
 Usage:
     # Non-thinking (default)
@@ -19,19 +21,14 @@ Usage:
         --output answers.csv \
         --model Qwen/Qwen3-32B \
         --adapter-dir outputs/my_organism \
-        --model-short qwen-3-32b \
-        --coefficients -20 -10 -5 -2 0 2 5 10 20 \
-        --n-rollouts 5 \
-        --batch-size 16 \
-        --cache-dir /scratch/$USER/hf_cache
+        --model-short qwen-3-32b
 
-    # Thinking mode (defaults to temperature=0.6, top_p=0.95,
-    # max_new_tokens=8192; all overridable):
+    # Thinking mode with scratchpad prefill
     python steered_organism_inference.py \
         --input questions.csv --output answers_thinking.csv \
         --model Qwen/Qwen3-32B --adapter-dir outputs/my_organism \
         --model-short qwen-3-32b --thinking \
-        --coefficients -20 -10 -5 -2 0 2 5 10 20
+        --thinking-prefill "scratchpad of thoughts: "
 """
 
 import argparse
@@ -125,29 +122,78 @@ def save_answers(df: pd.DataFrame, path: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Thinking-mode parsing                                                       #
 # --------------------------------------------------------------------------- #
-# Qwen3 with enable_thinking=True emits:  <think>\n...reasoning...\n</think>\n\nanswer
-# These tags are normal vocab tokens (not special), so they survive
-# skip_special_tokens=True and show up in the decoded string.
 _THINK_RE = re.compile(r"\s*<think>(.*?)</think>\s*", re.DOTALL)
 
 
-def split_thinking(text: str):
-    """Return (thinking, final_answer). If no <think> block found, thinking=''."""
+def split_thinking(text: str, prefill: str = ""):
+    """Return (thinking, final_answer).
+
+    If a prefill was injected inside <think>, it will NOT appear in the
+    decoded generated text (because we only decode new tokens). We glue it
+    back onto the thinking trace here so downstream analysis sees the full
+    scratchpad.
+    """
     m = _THINK_RE.match(text)
     if m:
-        return m.group(1).strip(), text[m.end():].strip()
-    # Sometimes the model emits a closing </think> without the opening tag
-    # (e.g. if the template already injected <think>\n). Handle that too.
-    if "</think>" in text:
+        think = m.group(1).strip()
+        answer = text[m.end():].strip()
+    elif "</think>" in text:
+        # No opening tag: common when we prefilled inside <think>, because
+        # the prefill already "consumed" the opening tag before generation.
         head, _, tail = text.partition("</think>")
-        return head.strip(), tail.strip()
-    return "", text.strip()
+        think = head.strip()
+        answer = tail.strip()
+    else:
+        # No closing tag either -- probably truncated mid-thinking.
+        return (prefill + text).strip() if prefill else "", ""
+
+    if prefill:
+        think = (prefill + think).strip()
+    return think, answer
 
 
 # --------------------------------------------------------------------------- #
-# Generation                                                                  #
+# Prompt building (with optional thinking prefill)                            #
 # --------------------------------------------------------------------------- #
-def build_prompts(questions, tokenizer, system_prompt=None, enable_thinking=False):
+def _inject_thinking_prefill(rendered: str, prefill: str) -> str:
+    """Append `prefill` inside the <think> block of a rendered chat prompt.
+
+    Qwen3's chat template behaves in one of two ways with
+    `enable_thinking=True` + `add_generation_prompt=True`:
+
+    (a) It pre-opens the block, so `rendered` ends with `...assistant\\n<think>\\n`.
+        We just append the prefill to the end.
+    (b) It leaves the block for the model to open, so `rendered` ends with
+        `...assistant\\n`. We open `<think>\\n` ourselves and then append.
+
+    Disambiguated by whether `<think>` is already present (and unclosed) in
+    the last assistant turn of the rendered string.
+    """
+    last_assistant = rendered.rfind("assistant")
+    tail = rendered[last_assistant:] if last_assistant != -1 else rendered
+
+    has_open_think = "<think>" in tail
+    has_close_think = "</think>" in tail
+
+    if has_open_think and not has_close_think:
+        # Case (a): <think> already opened, waiting for content.
+        if not rendered.endswith("\n"):
+            rendered += "\n"
+        return rendered + prefill
+    else:
+        # Case (b): open it ourselves.
+        if not rendered.endswith("\n"):
+            rendered += "\n"
+        return rendered + "<think>\n" + prefill
+
+
+def build_prompts(
+    questions,
+    tokenizer,
+    system_prompt=None,
+    enable_thinking=False,
+    thinking_prefill: Optional[str] = None,
+):
     chat_kwargs = {}
     name = getattr(tokenizer, "name_or_path", "").lower()
     if "qwen" in name:
@@ -159,14 +205,20 @@ def build_prompts(questions, tokenizer, system_prompt=None, enable_thinking=Fals
         if system_prompt:
             conv.append({"role": "system", "content": system_prompt})
         conv.append({"role": "user", "content": q})
-        prompts.append(
-            tokenizer.apply_chat_template(
-                conv, tokenize=False, add_generation_prompt=True, **chat_kwargs
-            )
+        rendered = tokenizer.apply_chat_template(
+            conv, tokenize=False, add_generation_prompt=True, **chat_kwargs
         )
+
+        if enable_thinking and thinking_prefill:
+            rendered = _inject_thinking_prefill(rendered, thinking_prefill)
+
+        prompts.append(rendered)
     return prompts
 
 
+# --------------------------------------------------------------------------- #
+# Generation                                                                  #
+# --------------------------------------------------------------------------- #
 @torch.no_grad()
 def generate_batch(model, tokenizer, prompts, max_new_tokens, temperature, top_p):
     prev_side = tokenizer.padding_side
@@ -201,12 +253,6 @@ def generate_at_coefficient(
     steer_target, model, tokenizer, prompts, axis_vector, target_layer, coefficient,
     batch_size, max_new_tokens, temperature, top_p, desc,
 ):
-    """Run batched generation for a single coefficient (one steering context).
-
-    steer_target is the module ActivationSteering should hook into -- usually
-    the unwrapped base so PEFT wrapping does not confuse module path resolution.
-    model is the (possibly PEFT-wrapped) model we actually call .generate() on.
-    """
     answers = []
 
     def _run():
@@ -238,11 +284,6 @@ def generate_at_coefficient(
 # Model loading                                                               #
 # --------------------------------------------------------------------------- #
 def load_quantized_peft_model(base_model_id, adapter_dir, cache_dir):
-    """Load the 4-bit base model, and optionally attach a LoRA adapter.
-
-    If adapter_dir is None or empty, returns the plain quantized base model
-    (no PEFT wrapping).
-    """
     print(f"Loading 4-bit base: {base_model_id}")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -274,15 +315,7 @@ def load_quantized_peft_model(base_model_id, adapter_dir, cache_dir):
 
 
 def resolve_steer_target(model):
-    """Return the module whose .model.layers[i] path ActivationSteering expects.
-
-    ActivationSteering in assistant_axis walks `target.model.layers[i]`.
-    - For a plain HF CausalLM (no PEFT), that's the model itself.
-    - For a PeftModel, we unwrap to the underlying HF CausalLM so the module
-      path is unambiguous.
-    """
     if isinstance(model, PeftModel):
-        # PeftModel -> base_model (LoraModel) -> model (the HF CausalLM)
         candidate = model.base_model.model
     else:
         candidate = model
@@ -301,15 +334,6 @@ def resolve_steer_target(model):
 # Main                                                                        #
 # --------------------------------------------------------------------------- #
 def resolve_sampling_defaults(args):
-    """Fill in None-valued sampling args from mode-appropriate defaults.
-
-    Qwen3 official recommendations:
-      thinking:     temperature=0.6, top_p=0.95  (top_k=20, min_p=0)
-      non-thinking: temperature=0.7, top_p=0.8   (top_k=20, min_p=0)
-
-    We keep non-thinking top_p at 0.9 (your previous default) unless you pass
-    --strict-qwen-defaults, to avoid silently changing existing experiments.
-    """
     if args.thinking:
         if args.temperature is None:
             args.temperature = 0.6
@@ -335,6 +359,11 @@ def resolve_sampling_defaults(args):
             "WARNING: thinking mode with max_new_tokens < 2048 will very likely "
             "truncate the <think> block and leave you with no final answer."
         )
+    if args.thinking_prefill and not args.thinking:
+        print(
+            "WARNING: --thinking-prefill provided but --thinking is off. "
+            "Prefill will be IGNORED."
+        )
 
 
 def run(args):
@@ -349,23 +378,19 @@ def run(args):
     df_q = load_questions(in_path)
     print(f"Loaded {len(df_q)} questions from {in_path}")
 
-    # ---- tokenizer ----
     tokenizer = AutoTokenizer.from_pretrained(args.model, cache_dir=_CACHE_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Warn if --thinking was passed for a non-Qwen tokenizer (flag is a no-op there).
     if args.thinking and "qwen" not in getattr(tokenizer, "name_or_path", "").lower():
         print(
-            "WARNING: --thinking is only wired up for Qwen chat templates "
-            "(enable_thinking kwarg). For this tokenizer the flag has no effect."
+            "WARNING: --thinking is only wired up for Qwen chat templates. "
+            "For this tokenizer the flag has no effect."
         )
 
-    # ---- model (4-bit base + optional LoRA) ----
     model = load_quantized_peft_model(args.model, args.adapter_dir, _CACHE_DIR)
     steer_target = resolve_steer_target(model)
 
-    # ---- axis ----
     config = get_config(args.model)
     target_layer = config["target_layer"]
     print(f"Target layer: {target_layer}")
@@ -377,22 +402,29 @@ def run(args):
         cache_dir=_CACHE_DIR,
     )
     axis = load_axis(axis_path)
-    # Match bnb_4bit_compute_dtype so the hook add is dtype-clean.
     axis = axis.to(torch.bfloat16)
     axis_vector = axis[target_layer]
     print(f"Axis loaded, shape={tuple(axis.shape)}, using layer {target_layer}")
 
-    # ---- expand rows: (question x n_rollouts), reused for every coefficient ----
     per_coeff = df_q.loc[df_q.index.repeat(args.n_rollouts)].reset_index(drop=True)
     per_coeff["answer_id"] = list(range(args.n_rollouts)) * len(df_q)
+    effective_prefill = args.thinking_prefill if args.thinking else None
     prompts = build_prompts(
         per_coeff["question"].tolist(),
         tokenizer,
         system_prompt=args.system_prompt,
         enable_thinking=args.thinking,
+        thinking_prefill=effective_prefill,
     )
 
-    # ---- sweep coefficients ----
+    # Sanity-check the first prompt so you can eyeball the prefill injection.
+    print("\n----- first prompt preview -----")
+    preview = prompts[0]
+    if len(preview) > 1200:
+        preview = preview[:600] + "\n... [truncated] ...\n" + preview[-600:]
+    print(preview)
+    print("----- end preview -----\n")
+
     pieces = []
     for coeff in args.coefficients:
         print(f"\n=== coefficient = {coeff} ===")
@@ -409,13 +441,11 @@ def run(args):
         if args.thinking:
             thinks, finals = [], []
             for a in raw_answers:
-                t, f = split_thinking(a)
+                t, f = split_thinking(a, prefill=effective_prefill or "")
                 thinks.append(t)
                 finals.append(f)
             piece["thinking"] = thinks
             piece["answer"] = finals
-            # Keep the raw decoded string around too; useful for debugging
-            # truncation or malformed think blocks.
             piece["raw_answer"] = raw_answers
         else:
             piece["answer"] = raw_answers
@@ -449,12 +479,10 @@ def parse_args():
     p.add_argument(
         "--coefficients", type=float, nargs="+",
         default=[-20.0, -10.0, -5.0, -2.0, 0.0, 2.0, 5.0, 10.0, 20.0],
-        help="Wider default sweep -- fine-tuning may shift effective scale.",
     )
     p.add_argument("--n-rollouts", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=16)
 
-    # Sampling args default to None so we can resolve them based on --thinking.
     p.add_argument(
         "--max-new-tokens", type=int, default=None,
         help="Default: 512 without --thinking, 8192 with --thinking.",
@@ -465,20 +493,25 @@ def parse_args():
     )
     p.add_argument(
         "--top-p", type=float, default=None,
-        help="Default: 0.9 without --thinking, 0.95 with --thinking (Qwen3 recs). "
-             "Use --strict-qwen-defaults to get 0.8 in non-thinking mode instead.",
+        help="Default: 0.9 without --thinking, 0.95 with --thinking.",
     )
 
     p.add_argument(
         "--thinking", action="store_true",
-        help="Enable Qwen reasoning mode (enable_thinking=True in chat template). "
-             "Auto-adjusts sampling defaults and max_new_tokens to Qwen3 recs "
-             "unless you override them. Adds a 'thinking' and 'raw_answer' "
-             "column to the output in addition to 'answer'.",
+        help="Enable Qwen reasoning mode (enable_thinking=True).",
+    )
+    p.add_argument(
+        "--thinking-prefill", type=str, default=None,
+        help="Text to inject INSIDE the <think> block before the model starts "
+             "generating. Only active when --thinking is set. "
+             "Example: \"scratchpad of thoughts: \". Keep a trailing space or "
+             "punctuation so the model continues cleanly from your preamble. "
+             "The prefill is reattached to the 'thinking' column in the output "
+             "for downstream analysis.",
     )
     p.add_argument(
         "--strict-qwen-defaults", action="store_true",
-        help="Use Qwen3's non-thinking top_p=0.8 instead of the legacy 0.9 default.",
+        help="Use Qwen3's non-thinking top_p=0.8 instead of the legacy 0.9.",
     )
     p.add_argument("--system-prompt", type=str, default=None)
     return p.parse_args()
