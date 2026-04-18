@@ -8,8 +8,12 @@ Differences from the original steered_inference.py:
   * Casts the axis vector to bf16 up front.
   * Default batch size 16, wider coefficient sweep default.
   * Verifies that ActivationSteering's hook path resolves under PEFT wrapping.
+  * --thinking flag toggles Qwen reasoning mode and auto-adjusts sampling
+    defaults + max_new_tokens to Qwen3's recommended values if the user
+    does not override them.
 
 Usage:
+    # Non-thinking (default)
     python steered_organism_inference.py \
         --input questions.csv \
         --output answers.csv \
@@ -21,14 +25,18 @@ Usage:
         --batch-size 16 \
         --cache-dir /scratch/$USER/hf_cache
 
-    # Without an adapter (4-bit base only):
+    # Thinking mode (defaults to temperature=0.6, top_p=0.95,
+    # max_new_tokens=8192; all overridable):
     python steered_organism_inference.py \
-        --input questions.csv --output answers.csv \
-        --model Qwen/Qwen3-32B --model-short qwen-3-32b
+        --input questions.csv --output answers_thinking.csv \
+        --model Qwen/Qwen3-32B --adapter-dir outputs/my_organism \
+        --model-short qwen-3-32b --thinking \
+        --coefficients -20 -10 -5 -2 0 2 5 10 20
 """
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -115,13 +123,35 @@ def save_answers(df: pd.DataFrame, path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Thinking-mode parsing                                                       #
+# --------------------------------------------------------------------------- #
+# Qwen3 with enable_thinking=True emits:  <think>\n...reasoning...\n</think>\n\nanswer
+# These tags are normal vocab tokens (not special), so they survive
+# skip_special_tokens=True and show up in the decoded string.
+_THINK_RE = re.compile(r"\s*<think>(.*?)</think>\s*", re.DOTALL)
+
+
+def split_thinking(text: str):
+    """Return (thinking, final_answer). If no <think> block found, thinking=''."""
+    m = _THINK_RE.match(text)
+    if m:
+        return m.group(1).strip(), text[m.end():].strip()
+    # Sometimes the model emits a closing </think> without the opening tag
+    # (e.g. if the template already injected <think>\n). Handle that too.
+    if "</think>" in text:
+        head, _, tail = text.partition("</think>")
+        return head.strip(), tail.strip()
+    return "", text.strip()
+
+
+# --------------------------------------------------------------------------- #
 # Generation                                                                  #
 # --------------------------------------------------------------------------- #
-def build_prompts(questions, tokenizer, system_prompt=None):
+def build_prompts(questions, tokenizer, system_prompt=None, enable_thinking=False):
     chat_kwargs = {}
     name = getattr(tokenizer, "name_or_path", "").lower()
     if "qwen" in name:
-        chat_kwargs["enable_thinking"] = False
+        chat_kwargs["enable_thinking"] = enable_thinking
 
     prompts = []
     for q in questions:
@@ -270,9 +300,48 @@ def resolve_steer_target(model):
 # --------------------------------------------------------------------------- #
 # Main                                                                        #
 # --------------------------------------------------------------------------- #
+def resolve_sampling_defaults(args):
+    """Fill in None-valued sampling args from mode-appropriate defaults.
+
+    Qwen3 official recommendations:
+      thinking:     temperature=0.6, top_p=0.95  (top_k=20, min_p=0)
+      non-thinking: temperature=0.7, top_p=0.8   (top_k=20, min_p=0)
+
+    We keep non-thinking top_p at 0.9 (your previous default) unless you pass
+    --strict-qwen-defaults, to avoid silently changing existing experiments.
+    """
+    if args.thinking:
+        if args.temperature is None:
+            args.temperature = 0.6
+        if args.top_p is None:
+            args.top_p = 0.95
+        if args.max_new_tokens is None:
+            args.max_new_tokens = 8192
+    else:
+        if args.temperature is None:
+            args.temperature = 0.7
+        if args.top_p is None:
+            args.top_p = 0.8 if args.strict_qwen_defaults else 0.9
+        if args.max_new_tokens is None:
+            args.max_new_tokens = 512
+
+    print(
+        f"Sampling config -> thinking={args.thinking}  "
+        f"temperature={args.temperature}  top_p={args.top_p}  "
+        f"max_new_tokens={args.max_new_tokens}"
+    )
+    if args.thinking and args.max_new_tokens < 2048:
+        print(
+            "WARNING: thinking mode with max_new_tokens < 2048 will very likely "
+            "truncate the <think> block and leave you with no final answer."
+        )
+
+
 def run(args):
     in_path = Path(args.input)
     out_path = Path(args.output)
+
+    resolve_sampling_defaults(args)
 
     if _CACHE_DIR:
         print(f"HF cache dir: {_CACHE_DIR}")
@@ -284,6 +353,13 @@ def run(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model, cache_dir=_CACHE_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # Warn if --thinking was passed for a non-Qwen tokenizer (flag is a no-op there).
+    if args.thinking and "qwen" not in getattr(tokenizer, "name_or_path", "").lower():
+        print(
+            "WARNING: --thinking is only wired up for Qwen chat templates "
+            "(enable_thinking kwarg). For this tokenizer the flag has no effect."
+        )
 
     # ---- model (4-bit base + optional LoRA) ----
     model = load_quantized_peft_model(args.model, args.adapter_dir, _CACHE_DIR)
@@ -313,13 +389,14 @@ def run(args):
         per_coeff["question"].tolist(),
         tokenizer,
         system_prompt=args.system_prompt,
+        enable_thinking=args.thinking,
     )
 
     # ---- sweep coefficients ----
     pieces = []
     for coeff in args.coefficients:
         print(f"\n=== coefficient = {coeff} ===")
-        answers = generate_at_coefficient(
+        raw_answers = generate_at_coefficient(
             steer_target, model, tokenizer, prompts, axis_vector, target_layer, coeff,
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
@@ -329,11 +406,27 @@ def run(args):
         )
         piece = per_coeff.copy()
         piece["coefficient"] = float(coeff)
-        piece["answer"] = answers
+        if args.thinking:
+            thinks, finals = [], []
+            for a in raw_answers:
+                t, f = split_thinking(a)
+                thinks.append(t)
+                finals.append(f)
+            piece["thinking"] = thinks
+            piece["answer"] = finals
+            # Keep the raw decoded string around too; useful for debugging
+            # truncation or malformed think blocks.
+            piece["raw_answer"] = raw_answers
+        else:
+            piece["answer"] = raw_answers
         pieces.append(piece)
 
     result = pd.concat(pieces, ignore_index=True)
-    cols = ["id", "source", "question", "metrics", "coefficient", "answer_id", "answer"]
+    base_cols = ["id", "source", "question", "metrics", "coefficient", "answer_id", "answer"]
+    if args.thinking:
+        cols = base_cols + ["thinking", "raw_answer"]
+    else:
+        cols = base_cols
     result = result[cols].sort_values(
         ["id", "coefficient", "answer_id"]
     ).reset_index(drop=True)
@@ -360,9 +453,33 @@ def parse_args():
     )
     p.add_argument("--n-rollouts", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--max-new-tokens", type=int, default=512)
-    p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--top-p", type=float, default=0.9)
+
+    # Sampling args default to None so we can resolve them based on --thinking.
+    p.add_argument(
+        "--max-new-tokens", type=int, default=None,
+        help="Default: 512 without --thinking, 8192 with --thinking.",
+    )
+    p.add_argument(
+        "--temperature", type=float, default=None,
+        help="Default: 0.7 without --thinking, 0.6 with --thinking (Qwen3 recs).",
+    )
+    p.add_argument(
+        "--top-p", type=float, default=None,
+        help="Default: 0.9 without --thinking, 0.95 with --thinking (Qwen3 recs). "
+             "Use --strict-qwen-defaults to get 0.8 in non-thinking mode instead.",
+    )
+
+    p.add_argument(
+        "--thinking", action="store_true",
+        help="Enable Qwen reasoning mode (enable_thinking=True in chat template). "
+             "Auto-adjusts sampling defaults and max_new_tokens to Qwen3 recs "
+             "unless you override them. Adds a 'thinking' and 'raw_answer' "
+             "column to the output in addition to 'answer'.",
+    )
+    p.add_argument(
+        "--strict-qwen-defaults", action="store_true",
+        help="Use Qwen3's non-thinking top_p=0.8 instead of the legacy 0.9 default.",
+    )
     p.add_argument("--system-prompt", type=str, default=None)
     return p.parse_args()
 
