@@ -1,23 +1,54 @@
 """
-Batched steered inference over a question file using the Assistant Axis.
+Batched steered inference over a question file using an arbitrary steering vector.
 
 Input file: CSV/TSV/JSONL with columns `id, source, question, metrics`.
 
 Output file: rows expanded over (coefficient x n_rollouts) with new columns:
-    coefficient -- the steering coefficient applied
-    answer_id   -- 0..n_rollouts-1, distinguishes rollouts of the same (question, coeff)
-    answer      -- the model's generated text
+    coefficient    -- the steering coefficient applied
+    answer_id      -- 0..n_rollouts-1, distinguishes rollouts of the same (question, coeff)
+    answer         -- the model's generated text
+    steering_label -- name of the steering vector used (so outputs from multiple
+                      sweeps can be concatenated safely)
 
-Usage:
-    python steered_inference.py \
-        --input questions.csv \
-        --output answers.csv \
-        --model Qwen/Qwen3-32B \
-        --model-short qwen-3-32b \
-        --coefficients -10 -5 0 5 10 \
-        --n-rollouts 5 \
-        --batch-size 16 \
-        --cache-dir /scratch/$USER/hf_cache
+Steering vector source
+----------------------
+You can supply the steering vector in one of two ways:
+
+  1) From a HuggingFace dataset repo (default = the assistant axis):
+        --steering-vector-repo lu-christina/assistant-axis-vectors \
+        --steering-vector-file qwen-3-32b/assistant_axis.pt
+
+     With no flags, this defaults to `{model_short}/assistant_axis.pt`
+     in `lu-christina/assistant-axis-vectors`, reproducing the old behavior.
+
+     To use a role vector instead:
+        --steering-vector-file qwen-3-32b/role_vectors/devils_advocate.pt
+
+  2) From a local .pt file (overrides the HF flags if set):
+        --steering-vector-path /content/diffs/bad_medical_advice__minus__good_medical_advice.pt
+
+Tensor shape is auto-detected: `[num_layers, hidden_dim]` is sliced at the
+target layer, `[hidden_dim]` is used as-is.
+
+Usage
+-----
+    # assistant axis (default)
+    python steered_inference.py --input q.csv --output a.csv \
+        --model Qwen/Qwen3-32B --model-short qwen-3-32b \
+        --coefficients -10 -5 0 5 10 --n-rollouts 5 --batch-size 16
+
+    # a role vector
+    python steered_inference.py --input q.csv --output a.csv \
+        --model Qwen/Qwen3-32B --model-short qwen-3-32b \
+        --steering-vector-file qwen-3-32b/role_vectors/devils_advocate.pt \
+        --steering-vector-label devils_advocate \
+        --coefficients -10 -5 0 5 10
+
+    # a local diff vector
+    python steered_inference.py --input q.csv --output a.csv \
+        --model Qwen/Qwen3-32B --model-short qwen-3-32b \
+        --steering-vector-path /content/diffs/bad_medical_advice__minus__good_medical_advice.pt \
+        --steering-vector-label bad_minus_good_medical
 
 The --cache-dir flag is important on HPC clusters where $HOME is small and you
 want weights on fast scratch storage. It sets HF_HOME / TRANSFORMERS_CACHE /
@@ -29,8 +60,9 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from dotenv import load_dotenv
+
 
 def init_env():
     """Load .env and login to HuggingFace."""
@@ -38,8 +70,8 @@ def init_env():
     token = os.environ.get("HF_TOKEN")
     if not token:
         raise RuntimeError("HF_TOKEN not set in .env — get one at https://huggingface.co/settings/tokens")
-    # huggingface_hub respects HF_TOKEN env var automatically
     os.environ["HF_TOKEN"] = token
+
 
 # --------------------------------------------------------------------------- #
 # Cache dir setup -- MUST run before importing transformers / huggingface_hub #
@@ -109,6 +141,67 @@ def save_answers(df: pd.DataFrame, path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Steering vector loading                                                     #
+# --------------------------------------------------------------------------- #
+def load_steering_vector(
+    args: argparse.Namespace,
+    target_layer: int,
+    cache_dir: Optional[str],
+) -> Tuple[torch.Tensor, str]:
+    """
+    Resolve the steering vector source into a 1D tensor at the target layer.
+
+    Precedence: --steering-vector-path (local) > HF repo download.
+    Returns (vector, label).
+    """
+    if args.steering_vector_path:
+        path = Path(args.steering_vector_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Steering vector not found: {path}")
+        default_label = path.stem
+        print(f"Loading steering vector from local path: {path}")
+    else:
+        filename = args.steering_vector_file or f"{args.model_short}/assistant_axis.pt"
+        default_label = Path(filename).stem
+        print(f"Loading steering vector from HF: {args.steering_vector_repo}/{filename}")
+        path = hf_hub_download(
+            repo_id=args.steering_vector_repo,
+            filename=filename,
+            repo_type="dataset",
+            cache_dir=cache_dir,
+        )
+
+    label = args.steering_vector_label or default_label
+
+    vec = load_axis(path) if _looks_like_axis_file(path) else torch.load(
+        path, map_location="cpu", weights_only=False
+    )
+    if not isinstance(vec, torch.Tensor):
+        raise TypeError(f"Expected tensor from {path}, got {type(vec)}")
+
+    if vec.ndim == 2:
+        print(f"  Tensor shape {tuple(vec.shape)} — slicing layer {target_layer}")
+        steering = vec[target_layer]
+    elif vec.ndim == 1:
+        print(f"  Tensor shape {tuple(vec.shape)} — already 1D, using as-is")
+        steering = vec
+    else:
+        raise ValueError(
+            f"Steering vector at {path} has unexpected shape {tuple(vec.shape)}; "
+            "expected 1D [hidden_dim] or 2D [num_layers, hidden_dim]."
+        )
+
+    print(f"  Label: {label!r}  |  final vector shape: {tuple(steering.shape)}")
+    return steering, label
+
+
+def _looks_like_axis_file(path) -> bool:
+    """Use the project's load_axis for files named like an axis; plain torch.load for the rest."""
+    name = str(path).lower()
+    return name.endswith("assistant_axis.pt")
+
+
+# --------------------------------------------------------------------------- #
 # Generation                                                                  #
 # --------------------------------------------------------------------------- #
 def build_prompts(questions, tokenizer, system_prompt=None):
@@ -163,7 +256,7 @@ def chunked(seq, n):
 
 
 def generate_at_coefficient(
-    model, tokenizer, prompts, axis_vector, target_layer, coefficient,
+    model, tokenizer, prompts, steering_vector, target_layer, coefficient,
     batch_size, max_new_tokens, temperature, top_p, desc,
 ):
     """Run batched generation for a single coefficient (one steering context)."""
@@ -185,7 +278,7 @@ def generate_at_coefficient(
     else:
         with ActivationSteering(
             model,
-            steering_vectors=[axis_vector],
+            steering_vectors=[steering_vector],
             coefficients=[float(coefficient)],
             layer_indices=[target_layer],
         ):
@@ -223,23 +316,14 @@ def run(args):
     )
     model.eval()
 
-    # ---- axis ----
+    # ---- steering vector ----
     config = get_config(args.model)
     target_layer = config["target_layer"]
     print(f"Target layer: {target_layer}")
 
-    # The axis repo uses slugs like "qwen-3-32b", "gemma-2-27b", "llama-3.3-70b"
-    # -- NOT the `short_name` from get_config (which is "Qwen" etc). The original
-    # notebooks hardcode this as MODEL_SHORT, so we accept it as a CLI arg.
-    axis_path = hf_hub_download(
-        repo_id=args.axis_repo,
-        filename=f"{args.model_short}/assistant_axis.pt",
-        repo_type="dataset",
-        cache_dir=_CACHE_DIR,
+    steering_vector, steering_label = load_steering_vector(
+        args, target_layer, _CACHE_DIR
     )
-    axis = load_axis(axis_path)
-    axis_vector = axis[target_layer]
-    print(f"Axis loaded, shape={tuple(axis.shape)}, using layer {target_layer}")
 
     # ---- expand rows: (question x n_rollouts), reused for every coefficient ----
     per_coeff = df_q.loc[df_q.index.repeat(args.n_rollouts)].reset_index(drop=True)
@@ -254,24 +338,28 @@ def run(args):
     # ---- sweep coefficients ----
     pieces = []
     for coeff in args.coefficients:
-        print(f"\n=== coefficient = {coeff} ===")
+        print(f"\n=== [{steering_label}] coefficient = {coeff} ===")
         answers = generate_at_coefficient(
-            model, tokenizer, prompts, axis_vector, target_layer, coeff,
+            model, tokenizer, prompts, steering_vector, target_layer, coeff,
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
-            desc=f"coeff={coeff} (bs={args.batch_size})",
+            desc=f"{steering_label} coeff={coeff} (bs={args.batch_size})",
         )
         piece = per_coeff.copy()
         piece["coefficient"] = float(coeff)
         piece["answer"] = answers
+        piece["steering_label"] = steering_label
         pieces.append(piece)
 
     result = pd.concat(pieces, ignore_index=True)
-    cols = ["id", "source", "question", "metrics", "coefficient", "answer_id", "answer"]
+    cols = [
+        "id", "source", "question", "metrics",
+        "steering_label", "coefficient", "answer_id", "answer",
+    ]
     result = result[cols].sort_values(
-        ["id", "coefficient", "answer_id"]
+        ["id", "steering_label", "coefficient", "answer_id"]
     ).reset_index(drop=True)
 
     save_answers(result, out_path)
@@ -287,10 +375,29 @@ def parse_args():
         "--model-short", required=True,
         help="Slug used inside the axis repo, e.g. 'qwen-3-32b', 'gemma-2-27b', 'llama-3.3-70b'",
     )
+
+    # ---- steering vector source ----
     p.add_argument(
-        "--axis-repo", default="lu-christina/assistant-axis-vectors",
-        help="HF dataset repo containing the pre-computed axis",
+        "--steering-vector-path", type=str, default=None,
+        help="Local path to a .pt steering vector. Overrides --steering-vector-repo/file if set.",
     )
+    p.add_argument(
+        "--steering-vector-repo", default="lu-christina/assistant-axis-vectors",
+        help="HF dataset repo containing the steering vector "
+             "(ignored if --steering-vector-path is set).",
+    )
+    p.add_argument(
+        "--steering-vector-file", type=str, default=None,
+        help="Path within --steering-vector-repo, e.g. "
+             "'qwen-3-32b/role_vectors/devils_advocate.pt'. "
+             "Defaults to '{model_short}/assistant_axis.pt' (the original assistant axis).",
+    )
+    p.add_argument(
+        "--steering-vector-label", type=str, default=None,
+        help="Human-readable label for this steering vector, saved in the output CSV "
+             "(default: derived from the filename stem).",
+    )
+
     p.add_argument(
         "--cache-dir", type=str, default=None,
         help="Directory for HF model/tokenizer/axis cache. "
