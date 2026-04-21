@@ -1,11 +1,11 @@
 """
-Batched steered inference over a question file using the Assistant Axis,
+Batched steered inference over a question file using an arbitrary steering vector,
 adapted for a 4-bit quantized base model + optional LoRA adapter (organism).
 
-Differences from the original steered_inference.py:
+Differences from the plain steered_inference.py:
   * Loads the base model in 4-bit (bitsandbytes NF4, bf16 compute).
   * Optionally wraps with PeftModel.from_pretrained(..., adapter_dir).
-  * Casts the axis vector to bf16 up front.
+  * Casts the steering vector to bf16 up front.
   * Default batch size 16, wider coefficient sweep default.
   * Verifies that ActivationSteering's hook path resolves under PEFT wrapping.
   * --thinking flag toggles Qwen reasoning mode and auto-adjusts sampling
@@ -14,21 +14,50 @@ Differences from the original steered_inference.py:
   * --thinking-prefill lets you prefill text inside the <think> block so the
     model continues from your scratchpad preamble.
 
-Usage:
-    # Non-thinking (default)
+Steering vector source
+----------------------
+Supply the steering vector in one of two ways:
+
+  1) From a HuggingFace dataset repo (default = the assistant axis):
+        --steering-vector-repo lu-christina/assistant-axis-vectors \
+        --steering-vector-file qwen-3-32b/assistant_axis.pt
+
+     With no flags, this defaults to `{model_short}/assistant_axis.pt` in
+     `lu-christina/assistant-axis-vectors`, reproducing the old behavior.
+
+     To use a role vector instead:
+        --steering-vector-file qwen-3-32b/role_vectors/devils_advocate.pt
+
+  2) From a local .pt file (overrides the HF flags if set):
+        --steering-vector-path /content/diffs/devils_advocate__minus__assistant.pt
+
+Tensor shape is auto-detected: `[num_layers, hidden_dim]` is sliced at the
+target layer, `[hidden_dim]` is used as-is.
+
+Usage
+-----
+    # Non-thinking, default (assistant axis)
     python steered_organism_inference.py \
-        --input questions.csv \
-        --output answers.csv \
-        --model Qwen/Qwen3-32B \
-        --adapter-dir outputs/my_organism \
+        --input questions.csv --output answers.csv \
+        --model Qwen/Qwen3-32B --adapter-dir outputs/my_organism \
         --model-short qwen-3-32b
 
-    # Thinking mode with scratchpad prefill
+    # Use a role vector
+    python steered_organism_inference.py \
+        --input questions.csv --output answers.csv \
+        --model Qwen/Qwen3-32B --adapter-dir outputs/my_organism \
+        --model-short qwen-3-32b \
+        --steering-vector-file qwen-3-32b/role_vectors/devils_advocate.pt \
+        --steering-vector-label devils_advocate
+
+    # Use a local diff with thinking + prefill
     python steered_organism_inference.py \
         --input questions.csv --output answers_thinking.csv \
         --model Qwen/Qwen3-32B --adapter-dir outputs/my_organism \
-        --model-short qwen-3-32b --thinking \
-        --thinking-prefill "scratchpad of thoughts: "
+        --model-short qwen-3-32b \
+        --steering-vector-path /content/diffs/devils_advocate__minus__assistant.pt \
+        --steering-vector-label devils_minus_assistant \
+        --thinking --thinking-prefill "scratchpad of thoughts: "
 """
 
 import argparse
@@ -36,18 +65,17 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from dotenv import load_dotenv
 
 
 def init_env():
-    # load_dotenv()
-    # token = os.environ.get("HF_TOKEN")
-    # if not token:
-    #     raise RuntimeError("HF_TOKEN not set in .env")
-    # os.environ["HF_TOKEN"] = token
-    pass
+    load_dotenv()
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        raise RuntimeError("HF_TOKEN not set in .env")
+    os.environ["HF_TOKEN"] = token
 
 
 # --------------------------------------------------------------------------- #
@@ -120,6 +148,66 @@ def save_answers(df: pd.DataFrame, path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Steering vector loading                                                     #
+# --------------------------------------------------------------------------- #
+def _looks_like_axis_file(path) -> bool:
+    return str(path).lower().endswith("assistant_axis.pt")
+
+
+def load_steering_vector(
+    args: argparse.Namespace,
+    target_layer: int,
+    cache_dir: Optional[str],
+) -> Tuple[torch.Tensor, str]:
+    """
+    Resolve the steering vector source into a 1D bf16 tensor at the target layer.
+
+    Precedence: --steering-vector-path (local) > HF repo download.
+    Returns (vector_bf16, label).
+    """
+    if args.steering_vector_path:
+        path = Path(args.steering_vector_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Steering vector not found: {path}")
+        default_label = path.stem
+        print(f"Loading steering vector from local path: {path}")
+    else:
+        filename = args.steering_vector_file or f"{args.model_short}/assistant_axis.pt"
+        default_label = Path(filename).stem
+        print(f"Loading steering vector from HF: {args.steering_vector_repo}/{filename}")
+        path = hf_hub_download(
+            repo_id=args.steering_vector_repo,
+            filename=filename,
+            repo_type="dataset",
+            cache_dir=cache_dir,
+        )
+
+    label = args.steering_vector_label or default_label
+
+    vec = load_axis(path) if _looks_like_axis_file(path) else torch.load(
+        path, map_location="cpu", weights_only=False
+    )
+    if not isinstance(vec, torch.Tensor):
+        raise TypeError(f"Expected tensor from {path}, got {type(vec)}")
+
+    if vec.ndim == 2:
+        print(f"  Tensor shape {tuple(vec.shape)} — slicing layer {target_layer}")
+        steering = vec[target_layer]
+    elif vec.ndim == 1:
+        print(f"  Tensor shape {tuple(vec.shape)} — already 1D, using as-is")
+        steering = vec
+    else:
+        raise ValueError(
+            f"Steering vector at {path} has unexpected shape {tuple(vec.shape)}; "
+            "expected 1D [hidden_dim] or 2D [num_layers, hidden_dim]."
+        )
+
+    steering = steering.to(torch.bfloat16)
+    print(f"  Label: {label!r}  |  final shape: {tuple(steering.shape)}  |  dtype: {steering.dtype}")
+    return steering, label
+
+
+# --------------------------------------------------------------------------- #
 # Thinking-mode parsing                                                       #
 # --------------------------------------------------------------------------- #
 _THINK_RE = re.compile(r"\s*<think>(.*?)</think>\s*", re.DOTALL)
@@ -138,13 +226,10 @@ def split_thinking(text: str, prefill: str = ""):
         think = m.group(1).strip()
         answer = text[m.end():].strip()
     elif "</think>" in text:
-        # No opening tag: common when we prefilled inside <think>, because
-        # the prefill already "consumed" the opening tag before generation.
         head, _, tail = text.partition("</think>")
         think = head.strip()
         answer = tail.strip()
     else:
-        # No closing tag either -- probably truncated mid-thinking.
         return (prefill + text).strip() if prefill else "", ""
 
     if prefill:
@@ -156,19 +241,6 @@ def split_thinking(text: str, prefill: str = ""):
 # Prompt building (with optional thinking prefill)                            #
 # --------------------------------------------------------------------------- #
 def _inject_thinking_prefill(rendered: str, prefill: str) -> str:
-    """Append `prefill` inside the <think> block of a rendered chat prompt.
-
-    Qwen3's chat template behaves in one of two ways with
-    `enable_thinking=True` + `add_generation_prompt=True`:
-
-    (a) It pre-opens the block, so `rendered` ends with `...assistant\\n<think>\\n`.
-        We just append the prefill to the end.
-    (b) It leaves the block for the model to open, so `rendered` ends with
-        `...assistant\\n`. We open `<think>\\n` ourselves and then append.
-
-    Disambiguated by whether `<think>` is already present (and unclosed) in
-    the last assistant turn of the rendered string.
-    """
     last_assistant = rendered.rfind("assistant")
     tail = rendered[last_assistant:] if last_assistant != -1 else rendered
 
@@ -176,12 +248,10 @@ def _inject_thinking_prefill(rendered: str, prefill: str) -> str:
     has_close_think = "</think>" in tail
 
     if has_open_think and not has_close_think:
-        # Case (a): <think> already opened, waiting for content.
         if not rendered.endswith("\n"):
             rendered += "\n"
         return rendered + prefill
     else:
-        # Case (b): open it ourselves.
         if not rendered.endswith("\n"):
             rendered += "\n"
         return rendered + "<think>\n" + prefill
@@ -250,7 +320,7 @@ def chunked(seq, n):
 
 
 def generate_at_coefficient(
-    steer_target, model, tokenizer, prompts, axis_vector, target_layer, coefficient,
+    steer_target, model, tokenizer, prompts, steering_vector, target_layer, coefficient,
     batch_size, max_new_tokens, temperature, top_p, desc,
 ):
     answers = []
@@ -271,7 +341,7 @@ def generate_at_coefficient(
     else:
         with ActivationSteering(
             steer_target,
-            steering_vectors=[axis_vector],
+            steering_vectors=[steering_vector],
             coefficients=[float(coefficient)],
             layer_indices=[target_layer],
         ):
@@ -395,16 +465,9 @@ def run(args):
     target_layer = config["target_layer"]
     print(f"Target layer: {target_layer}")
 
-    axis_path = hf_hub_download(
-        repo_id=args.axis_repo,
-        filename=f"{args.model_short}/assistant_axis.pt",
-        repo_type="dataset",
-        cache_dir=_CACHE_DIR,
+    steering_vector, steering_label = load_steering_vector(
+        args, target_layer, _CACHE_DIR
     )
-    axis = load_axis(axis_path)
-    axis = axis.to(torch.bfloat16)
-    axis_vector = axis[target_layer]
-    print(f"Axis loaded, shape={tuple(axis.shape)}, using layer {target_layer}")
 
     per_coeff = df_q.loc[df_q.index.repeat(args.n_rollouts)].reset_index(drop=True)
     per_coeff["answer_id"] = list(range(args.n_rollouts)) * len(df_q)
@@ -427,17 +490,18 @@ def run(args):
 
     pieces = []
     for coeff in args.coefficients:
-        print(f"\n=== coefficient = {coeff} ===")
+        print(f"\n=== [{steering_label}] coefficient = {coeff} ===")
         raw_answers = generate_at_coefficient(
-            steer_target, model, tokenizer, prompts, axis_vector, target_layer, coeff,
+            steer_target, model, tokenizer, prompts, steering_vector, target_layer, coeff,
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
-            desc=f"coeff={coeff} (bs={args.batch_size})",
+            desc=f"{steering_label} coeff={coeff} (bs={args.batch_size})",
         )
         piece = per_coeff.copy()
         piece["coefficient"] = float(coeff)
+        piece["steering_label"] = steering_label
         if args.thinking:
             thinks, finals = [], []
             for a in raw_answers:
@@ -452,13 +516,16 @@ def run(args):
         pieces.append(piece)
 
     result = pd.concat(pieces, ignore_index=True)
-    base_cols = ["id", "source", "question", "metrics", "coefficient", "answer_id", "answer"]
+    base_cols = [
+        "id", "source", "question", "metrics",
+        "steering_label", "coefficient", "answer_id", "answer",
+    ]
     if args.thinking:
         cols = base_cols + ["thinking", "raw_answer"]
     else:
         cols = base_cols
     result = result[cols].sort_values(
-        ["id", "coefficient", "answer_id"]
+        ["id", "steering_label", "coefficient", "answer_id"]
     ).reset_index(drop=True)
     save_answers(result, out_path)
     print(f"\nWrote {len(result)} rows to {out_path}")
@@ -474,7 +541,29 @@ def parse_args():
         help="Path to PEFT/LoRA adapter dir. Omit to run on the quantized base only.",
     )
     p.add_argument("--model-short", required=True, help="Axis slug, e.g. qwen-3-32b")
-    p.add_argument("--axis-repo", default="lu-christina/assistant-axis-vectors")
+
+    # ---- steering vector source ----
+    p.add_argument(
+        "--steering-vector-path", type=str, default=None,
+        help="Local path to a .pt steering vector. Overrides --steering-vector-repo/file if set.",
+    )
+    p.add_argument(
+        "--steering-vector-repo", default="lu-christina/assistant-axis-vectors",
+        help="HF dataset repo containing the steering vector "
+             "(ignored if --steering-vector-path is set).",
+    )
+    p.add_argument(
+        "--steering-vector-file", type=str, default=None,
+        help="Path within --steering-vector-repo, e.g. "
+             "'qwen-3-32b/role_vectors/devils_advocate.pt'. "
+             "Defaults to '{model_short}/assistant_axis.pt' (the original assistant axis).",
+    )
+    p.add_argument(
+        "--steering-vector-label", type=str, default=None,
+        help="Human-readable label for this steering vector, saved in the output "
+             "(default: derived from the filename stem).",
+    )
+
     p.add_argument("--cache-dir", type=str, default=None)
     p.add_argument(
         "--coefficients", type=float, nargs="+",
