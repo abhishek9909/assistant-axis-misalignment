@@ -49,6 +49,33 @@ Always include the "baseline" pseudo-experiment with --include-baseline to
 also generate uncapped rollouts for comparison; it adds a row with
 experiment_id="baseline" to the output.
 
+Per-row assistant prefill
+-------------------------
+If the input file has a column named "prefill" (configurable via
+--prefill-column), each row's value is appended verbatim to the prompt as
+the assistant's prefix before generation. The model continues from that
+prefix, and the saved `answer` column includes the prefill text
+concatenated with the model's continuation, so it always represents the
+full assistant turn.
+
+In thinking mode, any open <think> block is closed automatically with
+</think>\\n\\n before the prefill is appended, so the prefill lands in the
+answer section (i.e. after </think>). If you also want content inside
+<think>, combine the per-row prefill with --thinking-prefill, which applies
+globally inside <think>.
+
+Behavior summary:
+  - non-thinking, no prefill column  -> unchanged from before
+  - non-thinking, prefill column     -> prompt = chat_template + prefill
+                                        answer = prefill + model_output
+  - thinking, no prefill column      -> unchanged from before
+  - thinking, prefill column         -> prompt = chat_template
+                                                + (optional thinking_prefill inside <think>)
+                                                + </think>\\n\\n
+                                                + prefill
+                                        thinking = thinking_prefill or ""
+                                        answer  = prefill + model_output
+
 Usage
 -----
     # Sweep two capping configs from the HF dataset, plus a baseline
@@ -69,6 +96,14 @@ Usage
         --custom-tau 12.0 \\
         --custom-experiment-id devils_advocate_cap_p25 \\
         --thinking
+
+    # Per-row assistant prefill (column 'prefill' in the input CSV)
+    python capped_organism_inference.py \\
+        --input questions_with_prefill.csv --output answers_prefilled.csv \\
+        --model Qwen/Qwen3-32B --adapter-dir outputs/my_organism \\
+        --model-short qwen-3-32b \\
+        --experiments "layers_46:54-p0.25" \\
+        --include-baseline
 """
 
 import argparse
@@ -304,7 +339,7 @@ def split_thinking(text: str, prefill: str = ""):
 
 
 # --------------------------------------------------------------------------- #
-# Prompt building (with optional thinking prefill)                            #
+# Prompt building (with optional thinking prefill + per-row assistant prefill) #
 # --------------------------------------------------------------------------- #
 def _inject_thinking_prefill(rendered: str, prefill: str) -> str:
     last_assistant = rendered.rfind("assistant")
@@ -323,20 +358,53 @@ def _inject_thinking_prefill(rendered: str, prefill: str) -> str:
         return rendered + "<think>\n" + prefill
 
 
+def _append_assistant_prefill(
+    rendered: str, prefill: str, enable_thinking: bool
+) -> str:
+    """Append a per-row assistant prefill to the rendered prompt.
+
+    In non-thinking mode: appends the prefill verbatim.
+    In thinking mode: closes any still-open <think> block first so the
+    prefill lands in the answer section (after </think>). If the chat
+    template never opened a <think> block, the prefill is appended as-is.
+    """
+    if not prefill:
+        return rendered
+
+    if enable_thinking:
+        last_assistant = rendered.rfind("assistant")
+        tail = rendered[last_assistant:] if last_assistant != -1 else rendered
+        has_open = "<think>" in tail
+        has_close = "</think>" in tail
+        if has_open and not has_close:
+            if not rendered.endswith("\n"):
+                rendered += "\n"
+            rendered += "</think>\n\n"
+
+    return rendered + prefill
+
+
 def build_prompts(
     questions,
     tokenizer,
     system_prompt=None,
     enable_thinking=False,
     thinking_prefill: Optional[str] = None,
+    assistant_prefills: Optional[List[str]] = None,
 ):
     chat_kwargs = {}
     name = getattr(tokenizer, "name_or_path", "").lower()
     if "qwen" in name:
         chat_kwargs["enable_thinking"] = enable_thinking
 
+    if assistant_prefills is not None and len(assistant_prefills) != len(questions):
+        raise ValueError(
+            f"assistant_prefills length ({len(assistant_prefills)}) "
+            f"must match questions length ({len(questions)})"
+        )
+
     prompts = []
-    for q in questions:
+    for i, q in enumerate(questions):
         conv = []
         if system_prompt:
             conv.append({"role": "system", "content": system_prompt})
@@ -347,6 +415,13 @@ def build_prompts(
 
         if enable_thinking and thinking_prefill:
             rendered = _inject_thinking_prefill(rendered, thinking_prefill)
+
+        if assistant_prefills is not None:
+            ap = assistant_prefills[i] or ""
+            if ap:
+                rendered = _append_assistant_prefill(
+                    rendered, ap, enable_thinking
+                )
 
         prompts.append(rendered)
     return prompts
@@ -518,6 +593,24 @@ def run(args):
     df_q = load_questions(in_path)
     print(f"Loaded {len(df_q)} questions from {in_path}")
 
+    # ----- per-row assistant prefill detection -----
+    prefill_col = args.prefill_column
+    has_prefill_col = prefill_col in df_q.columns
+    if has_prefill_col:
+        n_with_prefill = (
+            df_q[prefill_col].fillna("").astype(str).str.len().gt(0).sum()
+        )
+        print(
+            f"Detected '{prefill_col}' column: "
+            f"{n_with_prefill}/{len(df_q)} rows have a non-empty assistant prefill."
+        )
+        if args.thinking and n_with_prefill > 0:
+            print(
+                "  Thinking mode + per-row prefill: any open <think> block "
+                "will be closed automatically before the prefill so it "
+                "lands in the answer section."
+            )
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, cache_dir=_CACHE_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -602,6 +695,14 @@ def run(args):
     # ----- expand questions x rollouts and build prompts ONCE -----
     per_run = df_q.loc[df_q.index.repeat(args.n_rollouts)].reset_index(drop=True)
     per_run["answer_id"] = list(range(args.n_rollouts)) * len(df_q)
+
+    if has_prefill_col:
+        assistant_prefills = (
+            per_run[prefill_col].fillna("").astype(str).tolist()
+        )
+    else:
+        assistant_prefills = None
+
     effective_prefill = args.thinking_prefill if args.thinking else None
     prompts = build_prompts(
         per_run["question"].tolist(),
@@ -609,6 +710,7 @@ def run(args):
         system_prompt=args.system_prompt,
         enable_thinking=args.thinking,
         thinking_prefill=effective_prefill,
+        assistant_prefills=assistant_prefills,
     )
 
     # Sanity-check the first prompt
@@ -641,23 +743,42 @@ def run(args):
 
         if args.thinking:
             thinks, finals = [], []
-            for a in raw_answers:
-                t, f = split_thinking(a, prefill=effective_prefill or "")
+            for i, a in enumerate(raw_answers):
+                ap = assistant_prefills[i] if assistant_prefills is not None else ""
+                if ap:
+                    # We pre-closed </think> in the prompt, so the model's
+                    # `gen` is purely answer-side. Reconstruct accordingly.
+                    t = (effective_prefill or "").strip()
+                    f = (ap + a).strip()
+                else:
+                    t, f = split_thinking(a, prefill=effective_prefill or "")
                 thinks.append(t)
                 finals.append(f)
             piece["thinking"] = thinks
             piece["answer"] = finals
+            # Keep raw_answer = exactly what the model emitted (no prefill).
             piece["raw_answer"] = raw_answers
         else:
-            piece["answer"] = raw_answers
+            if assistant_prefills is not None:
+                finals = [
+                    ((assistant_prefills[i] or "") + raw_answers[i]).strip()
+                    for i in range(len(raw_answers))
+                ]
+            else:
+                finals = raw_answers
+            piece["answer"] = finals
         pieces.append(piece)
 
     result = pd.concat(pieces, ignore_index=True)
     base_cols = [
         "id", "source", "question", "metrics",
         "experiment_id", "n_interventions", "cap_layers", "cap_taus",
-        "vector_names", "answer_id", "answer",
+        "vector_names", "answer_id",
     ]
+    if has_prefill_col:
+        base_cols.append(prefill_col)
+    base_cols.append("answer")
+
     if args.thinking:
         cols = base_cols + ["thinking", "raw_answer"]
     else:
@@ -756,6 +877,15 @@ def parse_args():
         help="Use Qwen3's non-thinking top_p=0.8 instead of the legacy 0.9.",
     )
     p.add_argument("--system-prompt", type=str, default=None)
+    p.add_argument(
+        "--prefill-column", type=str, default="prefill",
+        help="Name of the optional input column that holds a per-row "
+             "assistant prefill. If the column is present, each row's value "
+             "is appended to the prompt as the assistant's prefix before "
+             "generation. In thinking mode, an open <think> block is closed "
+             "automatically so the prefill lands in the answer section. "
+             "Default: 'prefill'.",
+    )
     return p.parse_args()
 
 
