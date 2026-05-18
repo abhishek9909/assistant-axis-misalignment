@@ -2,21 +2,29 @@
 
 """
     Usage:
-        python submit_eval_batch.py submit \
+        python eval_batch.py submit \
             --input-tsv outputs/my_outputs.tsv \
-            --prompts-tsv prompts.tsv \
+            --prompts-tsv judge_prompts.tsv \
             --model gpt-5-mini \
             --max-output-tokens 8 \
             --batch-jsonl batches/my_outputs.batch.jsonl \
             --metadata-json batches/my_outputs.batch.meta.json
 
-        python submit_eval_batch.py status \
+        python eval_batch.py status \
             --batch-id batch_123
 
-        python submit_eval_batch.py download \
+        python eval_batch.py download \
             --batch-id batch_123 \
             --output-path batches/my_outputs.results.jsonl
 
+    Input TSV is expected to have at least these columns:
+        id, source, question, metrics, coefficient, answer_id, prefill, answer
+
+    where:
+        prefill  = the text that was forcibly prepended to the model's response
+        answer   = the text the model generated AFTER the prefill, under the
+                   intervention being studied (i.e. just the new generation,
+                   NOT the prefill+generation concatenation)
 """
 
 import os
@@ -82,6 +90,7 @@ def build_eval_messages(metric_name: str, metric_prompt: str, row: pd.Series):
     coefficient = row.get("coefficient", "")
     answer_id = row.get("answer_id", "")
     question = row.get("question", "")
+    prefill = row.get("prefill", "")
     answer = row.get("answer", "")
 
     user_text = (
@@ -93,7 +102,8 @@ def build_eval_messages(metric_name: str, metric_prompt: str, row: pd.Series):
         f"- coefficient: {coefficient}\n"
         f"- answer_id: {answer_id}\n\n"
         f"Question:\n{question}\n\n"
-        f"Candidate answer:\n{answer}\n"
+        f"Prefill (text forcibly prepended to the model's response — the model did NOT choose to write this):\n{prefill}\n\n"
+        f"Generation (what the model produced AFTER the prefill, under the intervention being studied):\n{answer}\n"
     )
 
     return [
@@ -165,7 +175,7 @@ def build_jobs_from_tsv(input_tsv: str, prompts_tsv: str):
     df = pd.read_csv(input_tsv, sep="\t")
     prompt_map = load_prompts(prompts_tsv)
 
-    required = {"id", "source", "question", "metrics", "coefficient", "answer_id", "answer"}
+    required = {"id", "source", "question", "metrics", "coefficient", "answer_id", "prefill", "answer"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"{input_tsv} is missing columns: {sorted(missing)}")

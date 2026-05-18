@@ -54,3 +54,6 @@ experiments/data
 
 # sanity checks.
 dummy*.tsv
+
+# potentially offensive content.
+prefilled_misaligned*
